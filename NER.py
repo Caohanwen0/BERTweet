@@ -1,7 +1,9 @@
 from cmath import inf
+from msilib import sequence
 import bmtrain as bmt
 bmt.init_distributed(seed=0)
 import torch
+import numpy as np
 from model_center.model import Bert, BertConfig,Roberta,RobertaConfig
 from model_center.layer import Linear
 from model_center.dataset.bertdataset import DATASET
@@ -16,106 +18,88 @@ import pandas as pd
 import json
 from tqdm import tqdm
 
-from preprocess.prepare_dataset_SamVal import get_train_dataset, get_test_dataset
-from preprocess.prepare_dataset_3A import get_3A_dataset
+from prepare_WNUT16 import WNUT16_dataset
 ROBERTA_MODEL = 'roberta-base'
 PADDING_LEN = 512
 
 log_iter = 50
-label_num = 2
+label_num= 21
 epochs = 30
 batch_size = 32
 learning_rate = 1e-5
 warm_up_ratio = 0.1
+vocab_size = 50265
 
 PATH_TO_DATASET = 'data'
-BERT_PATH = '/data0/private/caohanwen/OpenSoCo/checkpoint/reddit_twitter/checkpoint-46499.pt'
+BERT_PATH = '/root/bm_train_codes/save/roberta-base_original_wwm/checkpoints/checkpoint-18799.pt'
 CHECKPOINT_PATH = 'saved_models/model.pt'
 SAVED_PATH = 'saved_models/valid_acc.csv'
 
 # bmt.print_rank("torch version", torch.__version__)
 # bmt.print_rank(torch.cuda.get_arch_list())
 
-class RobertaModel(torch.nn.Module):
+class TokenClassificationModel(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        # self.roberta = Roberta.from_pretrained(ROBERTA_MODEL) # load roberta from pretrained
-        self.roberta = Roberta(config)
-        bmt.load(self.roberta, BERT_PATH)
-        # print_inspect(self.roberta, "*")
-        self.dense = Linear(config.dim_model, label_num)
-        bmt.init_parameters(self.dense) # init dense layer
+        self.roberta = Roberta.from_pretrained(ROBERTA_MODEL) # load roberta from pretrained
+        # bmt.load(self.roberta, BERT_PATH)
+        print_inspect(self.roberta, "*")
+        self.classifier = Linear(config.hidden_size, config.num_labels)
+        bmt.init_parameters(self.classifier)
 
-    def forward(self, input_ids, attention_mask):
-        pooler_output = self.roberta(input_ids=input_ids, attention_mask=attention_mask).pooler_output
-        x = self.dense(pooler_output)
-        return x
+    def forward(self, input_ids, attention_mask = None):
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        logits = self.classifier(outputs)
+        return logits
 
 
 config = RobertaConfig.from_pretrained(ROBERTA_MODEL)
 model = RobertaModel(config)
+# bmt.load(model, CHECKPOINT_PATH)
 
 bmt.print_rank("Prepare dataset...")
-bmt.print_rank(f"local rank:{bmt.rank()}, world size:{bmt.world_size()}")
-# temp_texts, temp_labels = get_train_dataset() # 这里的temp_texts, temp_labels 就是两个同样长度的list，前者是raw text，后者是label（0，1，2）
-# test_texts, test_labels = get_test_dataset() #test_texts, test_labels 同上
-
-temp_texts, temp_labels = get_3A_dataset('data/SemEval3A/train_3A.txt', do_preprocess = True)
-test_texts, test_labels = get_3A_dataset('data/SemEval3A/gold_test_3A.txt', do_preprocess =True)
-train_texts, val_texts, train_labels, val_labels = train_test_split(
-    temp_texts,
-    temp_labels,
-    random_state = 2022, 
-    test_size=0.1, 
-    stratify = temp_labels
-) # split train and val
-bmt.print_rank(f"train, val and test size is {len(train_labels)}, {len(val_labels)}, {len(test_labels)}")
-# tokenizer = RobertaTokenizer.from_pretrained(ROBERTA_MODEL)
-from tokenizers import Tokenizer
-from transformers import PreTrainedTokenizerFast
+bmt.print_rank(f"Local rank:{bmt.rank()}, World size:{bmt.world_size()}")
+# train_texts, train_labels = get_WNUT16_data('WNUT16/wnut16_train.txt')
+# val_texts, val_labels = get_WNUT16_data('WNUT16/wnut16_dev.txt')
+# test_texts, test_labels = get_WNUT16_data('WNUT16/wnut16_test.txt')
+train_dataset = WNUT16_Dataset('WNUT16/wnut16_train.txt')
+val_dataset =  WNUT16_Dataset('WNUT16/wnut16_dev.txt')
+test_dataset =  WNUT16_Dataset('WNUT16/wnut16_test.txt')
 
 
-tokenizer_obj = Tokenizer.from_file('/root/bm_train_codes/tokenizer/tokenizer_.json')
-tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer_obj)
-tokenizer.pad_token = '<pad>'
-tokenizer.eos_token = '</s>'
-tokenizer.sep_token = '<s>'
-tokenizer.mask_token = '<mask>'
 
-tokens_train = tokenizer.batch_encode_plus(
-    train_texts,
-    max_length = PADDING_LEN,
-    padding='max_length',
-    truncation=True
-)
+tokenizer = RobertaTokenizer.from_pretrained(ROBERTA_MODEL)
+# from tokenizers import Tokenizer
+# from transformers import PreTrainedTokenizerFast
+# tokenizer_obj = Tokenizer.from_file('tokenizer/tokenizer.json')
+# tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer_obj)
+# tokenizer.pad_token = '[PAD]'
+# tokenizer.eos_token = '[EOS]'
+# tokenizer.sep_token = '[SEP]'
+# tokenizer.mask_token = '[MASK]'
+# tokenizer.sep_token = '[SEP]'
 
-tokens_val = tokenizer.batch_encode_plus(
-    val_texts,
-    max_length = PADDING_LEN,
-    padding='max_length',
-    truncation=True
-)
+def batch_iter(dataset):
+    st = 0
+    input_ids_list = []
+    labels_list = []
+    while True:
+        input_ids, attention_mask, labels = dataset[st]
+        st += 1
+        input_ids_list.append(input_ids)
+        labels_list.append(labels)
+        attention_mask_list.append(attention_mask)
 
-tokens_test = tokenizer.batch_encode_plus(
-    test_texts,
-    max_length = PADDING_LEN,
-    padding='max_length',
-    truncation=True
-)
+        if len(input_ids_list) >= batch_size:
+            yield {
+                "input_ids": torch.stack(input_ids_list),
+                "attention_mask": torch.stack(attention_mask_list),
+                "labels": torch.stack(labels_list)
+            }
+            input_ids_list = []
+            attention_mask_list = []
+            labels_list = []
 
-train_data = TensorDataset(torch.tensor(tokens_train['input_ids']).cuda(), \
-    torch.tensor(tokens_train['attention_mask']).cuda(), \
-    torch.tensor(train_labels).cuda())
-val_data = TensorDataset(torch.tensor(tokens_val['input_ids']).cuda(), \
-    torch.tensor(tokens_val['attention_mask']).cuda(), \
-    torch.tensor(val_labels).cuda())
-test_data = TensorDataset(torch.tensor(tokens_test['input_ids']).cuda(), \
-    torch.tensor(tokens_test['attention_mask']).cuda(), \
-    torch.tensor(test_labels).cuda())
-
-train_dataloader = DistributedDataLoader(train_data, batch_size = batch_size, shuffle = True)
-val_dataloader = DistributedDataLoader(val_data, batch_size = batch_size, shuffle = False)
-test_dataloader = DistributedDataLoader(test_data, batch_size = batch_size, shuffle = False)
 # splits = ['val', 'train', 'test']
 # dataset = {}
 # # 手动load test json
@@ -137,7 +121,6 @@ test_dataloader = DistributedDataLoader(test_data, batch_size = batch_size, shuf
 # val_dataloader = DistributedDataLoader(dataset['val'], batch_size=batch_size, shuffle=False)
 
 # optimizer and lr-scheduler
-total_step = (len(train_dataloader)) * epochs
 optimizer = bmt.optim.AdamOptimizer(model.parameters(),lr = 1e-5, betas=(0.9,0.98))
 # optimizer = bmt.optim.AdamOffloadOptimizer(model.parameters())
 # lr_scheduler = bmt.lr_scheduler.Linear(
@@ -155,11 +138,21 @@ def fine_tune():
     for epoch in range(epochs):
         bmt.print_rank("Epoch {} begin...".format(epoch + 1))
         model.train()
-        for step, data in enumerate(train_dataloader):
-            input_ids, attention_mask, labels = data
+        pd = []
+        gt = []
+        for step, data in enumerate(batch_iter()):
+            words,tags = data
+            tags = np.array(tags.cuda())
+            inpud_ids = words['input_ids'].cuda()
+            attention_mask = words['attention_mask'].cuda()
             optimizer.zero_grad()
             logits = model(input_ids, attention_mask)
             loss = loss_func(logits.view(-1, logits.shape[-1]), labels.view(-1))
+            clean_idx = (tags != -100)
+            logits_clean = np.array(logits)[clean_idx]
+            label_clean = tags[clean_idx]
+            predictions = logits_clean.argmax(dim=1)
+            
             global_loss = bmt.sum_loss(loss).item()
             loss = optimizer.loss_scale(loss)
             loss.backward()
@@ -174,6 +167,7 @@ def fine_tune():
                         grad_norm,
                     )
                 )
+        
         model.eval()
         with torch.no_grad():
             pd = [] # prediction
